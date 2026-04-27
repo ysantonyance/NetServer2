@@ -7,60 +7,44 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-// Сховище підключених клієнтів
-var _clients = new ConcurrentDictionary<string, ClientConnection>();
-var _messages = new List<ChatMessage>();
-var _messagesLock = new object();
+var clients = new ConcurrentDictionary<string, WebSocket>();
+var messageHistory = new List<ChatMessage>();
+var historyLock = new object();
 
-// Middleware для WebSocket
 app.UseWebSockets();
-
-app.MapGet("/", async context =>
-{
-    context.Response.ContentType = "text/html";
-    string html = "<!DOCTYPE html><html><head><title>WebSocket Chat Server</title></head><body><h1>WebSocket Chat Server Running</h1><p>WebSocket endpoint: ws://" + context.Request.Host + "/chat</p></body></html>";
-    await context.Response.WriteAsync(html);
-});
 
 app.Map("/chat", async context =>
 {
     if (context.WebSockets.IsWebSocketRequest)
     {
-        using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-        string clientId = Guid.NewGuid().ToString("N")[..8];
+        var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+        var clientId = Guid.NewGuid().ToString("N")[..8];
         
-        // Реєстрація нового клієнта
-        var client = new ClientConnection
-        {
-            Id = clientId,
-            Socket = webSocket,
-            LastSeen = DateTime.UtcNow
-        };
+        clients[clientId] = webSocket;
+        Console.WriteLine($"[+] Connected: {clientId}, Total: {clients.Count}");
         
-        _clients[clientId] = client;
-        
-        string joinMsg = $"Клієнт {clientId} приєднався до чату";
-        AddSystemMessage(joinMsg);
-        Console.WriteLine($"[+] {joinMsg}. Клієнтів: {_clients.Count}");
-        
-        // Відправляємо історію повідомлень новому клієнту
-        await SendToClient(client, new ServerMessage
-        {
-            Type = "history",
-            Messages = GetMessagesCopy()
+        // Відправляємо історію новому клієнту
+        await SendToClient(webSocket, new ServerMessage 
+        { 
+            Type = "history", 
+            Messages = GetMessageHistory() 
         });
         
-        // Повідомляємо ВСІМ іншим клієнтам про нового користувача
-        await BroadcastSystemMessage(joinMsg, clientId);
+        // Повідомляємо всім про нового клієнта
+        await BroadcastMessage(new ChatMessage
+        {
+            From = "server",
+            Text = $"Client {clientId} joined",
+            IsSystem = true,
+            Timestamp = DateTime.UtcNow
+        }, clientId);
         
-        // Обробка вхідних повідомлень
         var buffer = new byte[4096];
+        
         try
         {
             while (webSocket.State == WebSocketState.Open)
@@ -68,155 +52,91 @@ app.Map("/chat", async context =>
                 var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
                 
                 if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
                     break;
-                }
                 
                 if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
                 {
-                    var messageText = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    Console.WriteLine($"Отримано від {clientId}: {messageText}");
+                    var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                    Console.WriteLine($"[RECV] {clientId}: {json}");
                     
                     try
                     {
-                        var clientMessage = JsonSerializer.Deserialize<ClientMessage>(messageText);
-                        
-                        if (clientMessage?.Text != null && !string.IsNullOrWhiteSpace(clientMessage.Text))
+                        var clientMsg = JsonSerializer.Deserialize<ClientMessage>(json);
+                        if (!string.IsNullOrWhiteSpace(clientMsg?.Text))
                         {
-                            AddMessage(clientId, clientMessage.Text);
-                            Console.WriteLine($"[{clientId}]: {clientMessage.Text}");
-                            
-                            // Розсилаємо повідомлення ВСІМ клієнтам
-                            var serverMsg = new ServerMessage
+                            var chatMsg = new ChatMessage
                             {
-                                Type = "message",
-                                Message = new ChatMessage
-                                {
-                                    From = clientId,
-                                    Text = clientMessage.Text,
-                                    IsSystem = false,
-                                    Timestamp = DateTime.UtcNow
-                                }
+                                From = clientId,
+                                Text = clientMsg.Text,
+                                IsSystem = false,
+                                Timestamp = DateTime.UtcNow
                             };
                             
-                            await BroadcastMessage(serverMsg);
+                            // Зберігаємо в історію
+                            lock (historyLock)
+                            {
+                                messageHistory.Add(chatMsg);
+                                if (messageHistory.Count > 100)
+                                    messageHistory.RemoveAt(0);
+                            }
+                            
+                            // Розсилаємо ВСІМ клієнтам
+                            Console.WriteLine($"[BROADCAST] {clientId}: {clientMsg.Text}");
+                            await BroadcastMessage(chatMsg);
                         }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Помилка десеріалізації: {ex.Message}");
+                        Console.WriteLine($"[ERROR] Parse error: {ex.Message}");
                     }
                 }
-                
-                client.LastSeen = DateTime.UtcNow;
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Помилка з клієнтом {clientId}: {ex.Message}");
+            Console.WriteLine($"[ERROR] Client {clientId}: {ex.Message}");
         }
         finally
         {
-            // Видалення клієнта
-            _clients.TryRemove(clientId, out _);
-            string leaveMsg = $"Клієнт {clientId} покинув чат";
-            AddSystemMessage(leaveMsg);
-            Console.WriteLine($"[-] {leaveMsg}. Клієнтів: {_clients.Count}");
-            await BroadcastSystemMessage(leaveMsg);
+            clients.TryRemove(clientId, out _);
+            Console.WriteLine($"[-] Disconnected: {clientId}, Total: {clients.Count}");
             
-            if (webSocket.State != WebSocketState.Closed)
-                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            await BroadcastMessage(new ChatMessage
+            {
+                From = "server",
+                Text = $"Client {clientId} left",
+                IsSystem = true,
+                Timestamp = DateTime.UtcNow
+            });
+            
+            try
+            {
+                if (webSocket.State != WebSocketState.Closed && webSocket.State != WebSocketState.Aborted)
+                    await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            }
+            catch { }
+            webSocket.Dispose();
         }
     }
     else
     {
         context.Response.StatusCode = 400;
-        await context.Response.WriteAsync("WebSocket connection expected");
+        await context.Response.WriteAsync("WebSocket required");
     }
 });
 
-// Фоновий таймер для очищення неактивних клієнтів
-_ = Task.Run(async () =>
+async Task BroadcastMessage(ChatMessage message, string excludeClientId = null)
 {
-    while (true)
-    {
-        await Task.Delay(TimeSpan.FromSeconds(30));
-        var cutoff = DateTime.UtcNow.AddSeconds(-120);
-        foreach (var (id, client) in _clients)
-        {
-            if (client.LastSeen < cutoff && _clients.TryRemove(id, out _))
-            {
-                string timeoutMsg = $"Клієнт {id} відключився (таймаут)";
-                AddSystemMessage(timeoutMsg);
-                Console.WriteLine($"[~] {timeoutMsg}. Клієнтів: {_clients.Count}");
-                
-                try
-                {
-                    if (client.Socket.State == WebSocketState.Open)
-                    {
-                        await client.Socket.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, 
-                            "Timeout", CancellationToken.None);
-                    }
-                }
-                catch { }
-            }
-        }
-    }
-});
-
-void AddMessage(string clientId, string text)
-{
-    lock (_messagesLock)
-    {
-        _messages.Add(new ChatMessage 
-        { 
-            From = clientId, 
-            Text = text, 
-            IsSystem = false,
-            Timestamp = DateTime.UtcNow
-        });
-        
-        // Обмежуємо історію 1000 повідомленнями
-        while (_messages.Count > 1000)
-            _messages.RemoveAt(0);
-    }
-}
-
-void AddSystemMessage(string text)
-{
-    lock (_messagesLock)
-    {
-        _messages.Add(new ChatMessage 
-        { 
-            From = "server", 
-            Text = text, 
-            IsSystem = true,
-            Timestamp = DateTime.UtcNow
-        });
-    }
-}
-
-List<ChatMessage> GetMessagesCopy()
-{
-    lock (_messagesLock)
-    {
-        return new List<ChatMessage>(_messages);
-    }
-}
-
-async Task BroadcastMessage(ServerMessage message)
-{
-    var json = JsonSerializer.Serialize(message);
+    var serverMsg = new ServerMessage { Type = "message", Message = message };
+    var json = JsonSerializer.Serialize(serverMsg);
     var bytes = Encoding.UTF8.GetBytes(json);
-    var segment = new ArraySegment<byte>(bytes);
     
     var tasks = new List<Task>();
-    foreach (var client in _clients.Values)
+    foreach (var client in clients)
     {
-        if (client.Socket.State == WebSocketState.Open)
+        if (client.Value.State == WebSocketState.Open && (excludeClientId == null || client.Key != excludeClientId))
         {
-            tasks.Add(SendToClientSafe(client, segment));
+            tasks.Add(SafeSend(client.Value, bytes));
         }
     }
     
@@ -224,77 +144,45 @@ async Task BroadcastMessage(ServerMessage message)
         await Task.WhenAll(tasks);
 }
 
-async Task SendToClientSafe(ClientConnection client, ArraySegment<byte> segment)
-{
-    try
-    {
-        await client.Socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Помилка відправки клієнту {client.Id}: {ex.Message}");
-    }
-}
-
-async Task BroadcastSystemMessage(string text, string excludeClientId = null)
-{
-    var message = new ServerMessage
-    {
-        Type = "message",
-        Message = new ChatMessage
-        {
-            From = "server",
-            Text = text,
-            IsSystem = true,
-            Timestamp = DateTime.UtcNow
-        }
-    };
-    
-    var json = JsonSerializer.Serialize(message);
-    var bytes = Encoding.UTF8.GetBytes(json);
-    var segment = new ArraySegment<byte>(bytes);
-    
-    var tasks = new List<Task>();
-    foreach (var client in _clients.Values)
-    {
-        if (client.Socket.State == WebSocketState.Open)
-        {
-            if (excludeClientId == null || client.Id != excludeClientId)
-            {
-                tasks.Add(SendToClientSafe(client, segment));
-            }
-        }
-    }
-    
-    if (tasks.Count > 0)
-        await Task.WhenAll(tasks);
-}
-
-async Task SendToClient(ClientConnection client, ServerMessage message)
+async Task SendToClient(WebSocket socket, ServerMessage message)
 {
     try
     {
         var json = JsonSerializer.Serialize(message);
         var bytes = Encoding.UTF8.GetBytes(json);
-        var segment = new ArraySegment<byte>(bytes);
-        
-        await client.Socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+        await SafeSend(socket, bytes);
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Помилка відправки клієнту {client.Id}: {ex.Message}");
+        Console.WriteLine($"[ERROR] Send failed: {ex.Message}");
+    }
+}
+
+async Task SafeSend(WebSocket socket, byte[] bytes)
+{
+    try
+    {
+        if (socket.State == WebSocketState.Open)
+        {
+            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERROR] Send error: {ex.Message}");
+    }
+}
+
+List<ChatMessage> GetMessageHistory()
+{
+    lock (historyLock)
+    {
+        return new List<ChatMessage>(messageHistory);
     }
 }
 
 string port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Run($"http://0.0.0.0:{port}");
-
-class ClientConnection
-{
-    public required string Id { get; set; }
-    public required WebSocket Socket { get; set; }
-    public DateTime LastSeen { get; set; }
-}
 
 class ChatMessage
 {
