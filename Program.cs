@@ -56,8 +56,8 @@ app.Map("/chat", async context =>
             Messages = GetMessagesCopy()
         });
         
-        // Повідомляємо всім про нового користувача
-        await BroadcastSystemMessage(joinMsg);
+        // Повідомляємо ВСІМ іншим клієнтам про нового користувача
+        await BroadcastSystemMessage(joinMsg, clientId);
         
         // Обробка вхідних повідомлень
         var buffer = new byte[4096];
@@ -73,28 +73,39 @@ app.Map("/chat", async context =>
                     break;
                 }
                 
-                if (result.MessageType == WebSocketMessageType.Text)
+                if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
                 {
                     var messageText = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    var clientMessage = JsonSerializer.Deserialize<ClientMessage>(messageText);
+                    Console.WriteLine($"Отримано від {clientId}: {messageText}");
                     
-                    if (clientMessage?.Text != null)
+                    try
                     {
-                        AddMessage(clientId, clientMessage.Text);
-                        Console.WriteLine($"[{clientId}]: {clientMessage.Text}");
+                        var clientMessage = JsonSerializer.Deserialize<ClientMessage>(messageText);
                         
-                        // Розсилаємо повідомлення всім клієнтам
-                        await BroadcastMessage(new ServerMessage
+                        if (clientMessage?.Text != null && !string.IsNullOrWhiteSpace(clientMessage.Text))
                         {
-                            Type = "message",
-                            Message = new ChatMessage
+                            AddMessage(clientId, clientMessage.Text);
+                            Console.WriteLine($"[{clientId}]: {clientMessage.Text}");
+                            
+                            // Розсилаємо повідомлення ВСІМ клієнтам
+                            var serverMsg = new ServerMessage
                             {
-                                From = clientId,
-                                Text = clientMessage.Text,
-                                IsSystem = false,
-                                Timestamp = DateTime.UtcNow
-                            }
-                        });
+                                Type = "message",
+                                Message = new ChatMessage
+                                {
+                                    From = clientId,
+                                    Text = clientMessage.Text,
+                                    IsSystem = false,
+                                    Timestamp = DateTime.UtcNow
+                                }
+                            };
+                            
+                            await BroadcastMessage(serverMsg);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Помилка десеріалізації: {ex.Message}");
                     }
                 }
                 
@@ -205,7 +216,7 @@ async Task BroadcastMessage(ServerMessage message)
     {
         if (client.Socket.State == WebSocketState.Open)
         {
-            tasks.Add(client.Socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None));
+            tasks.Add(SendToClientSafe(client, segment));
         }
     }
     
@@ -213,9 +224,21 @@ async Task BroadcastMessage(ServerMessage message)
         await Task.WhenAll(tasks);
 }
 
-async Task BroadcastSystemMessage(string text)
+async Task SendToClientSafe(ClientConnection client, ArraySegment<byte> segment)
 {
-    await BroadcastMessage(new ServerMessage
+    try
+    {
+        await client.Socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Помилка відправки клієнту {client.Id}: {ex.Message}");
+    }
+}
+
+async Task BroadcastSystemMessage(string text, string excludeClientId = null)
+{
+    var message = new ServerMessage
     {
         Type = "message",
         Message = new ChatMessage
@@ -225,7 +248,26 @@ async Task BroadcastSystemMessage(string text)
             IsSystem = true,
             Timestamp = DateTime.UtcNow
         }
-    });
+    };
+    
+    var json = JsonSerializer.Serialize(message);
+    var bytes = Encoding.UTF8.GetBytes(json);
+    var segment = new ArraySegment<byte>(bytes);
+    
+    var tasks = new List<Task>();
+    foreach (var client in _clients.Values)
+    {
+        if (client.Socket.State == WebSocketState.Open)
+        {
+            if (excludeClientId == null || client.Id != excludeClientId)
+            {
+                tasks.Add(SendToClientSafe(client, segment));
+            }
+        }
+    }
+    
+    if (tasks.Count > 0)
+        await Task.WhenAll(tasks);
 }
 
 async Task SendToClient(ClientConnection client, ServerMessage message)
