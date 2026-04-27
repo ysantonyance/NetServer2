@@ -24,15 +24,8 @@ app.UseWebSockets();
 app.MapGet("/", async context =>
 {
     context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync(@"
-<!DOCTYPE html>
-<html>
-<head><title>WebSocket Chat Server</title></head>
-<body>
-<h1>WebSocket Chat Server Running</h1>
-<p>WebSocket endpoint: ws://" + context.Request.Host + "/chat</p>
-</body>
-</html>");
+    string html = "<!DOCTYPE html><html><head><title>WebSocket Chat Server</title></head><body><h1>WebSocket Chat Server Running</h1><p>WebSocket endpoint: ws://" + context.Request.Host + "/chat</p></body></html>";
+    await context.Response.WriteAsync(html);
 });
 
 app.Map("/chat", async context =>
