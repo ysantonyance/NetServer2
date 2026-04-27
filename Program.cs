@@ -28,11 +28,12 @@ app.Map("/chat", async context =>
         Console.WriteLine($"[+] Connected: {clientId}, Total: {clients.Count}");
         
         // Відправляємо історію новому клієнту
-        await SendToClient(webSocket, new ServerMessage 
+        var historyMsg = new ServerMessage 
         { 
             Type = "history", 
             Messages = GetMessageHistory() 
-        });
+        };
+        await SendToClient(webSocket, historyMsg);
         
         // Повідомляємо всім про нового клієнта
         await BroadcastMessage(new ChatMessage
@@ -80,7 +81,7 @@ app.Map("/chat", async context =>
                                     messageHistory.RemoveAt(0);
                             }
                             
-                            // Розсилаємо ВСІМ клієнтам
+                            // Розсилаємо ВСІМ клієнтам (включаючи відправника?)
                             Console.WriteLine($"[BROADCAST] {clientId}: {clientMsg.Text}");
                             await BroadcastMessage(chatMsg);
                         }
@@ -130,18 +131,24 @@ async Task BroadcastMessage(ChatMessage message, string excludeClientId = null)
     var serverMsg = new ServerMessage { Type = "message", Message = message };
     var json = JsonSerializer.Serialize(serverMsg);
     var bytes = Encoding.UTF8.GetBytes(json);
+    var segment = new ArraySegment<byte>(bytes);
     
-    var tasks = new List<Task>();
     foreach (var client in clients)
     {
+        // Відправляємо всім, включаючи відправника (щоб він бачив своє повідомлення)
         if (client.Value.State == WebSocketState.Open && (excludeClientId == null || client.Key != excludeClientId))
         {
-            tasks.Add(SafeSend(client.Value, bytes));
+            try
+            {
+                await client.Value.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                Console.WriteLine($"[SENT] to {client.Key}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Send to {client.Key} failed: {ex.Message}");
+            }
         }
     }
-    
-    if (tasks.Count > 0)
-        await Task.WhenAll(tasks);
 }
 
 async Task SendToClient(WebSocket socket, ServerMessage message)
@@ -150,26 +157,11 @@ async Task SendToClient(WebSocket socket, ServerMessage message)
     {
         var json = JsonSerializer.Serialize(message);
         var bytes = Encoding.UTF8.GetBytes(json);
-        await SafeSend(socket, bytes);
+        await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
     }
     catch (Exception ex)
     {
         Console.WriteLine($"[ERROR] Send failed: {ex.Message}");
-    }
-}
-
-async Task SafeSend(WebSocket socket, byte[] bytes)
-{
-    try
-    {
-        if (socket.State == WebSocketState.Open)
-        {
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[ERROR] Send error: {ex.Message}");
     }
 }
 
