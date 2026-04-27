@@ -14,9 +14,9 @@ var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
 // Сховище підключених клієнтів
-static readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
-static readonly List<ChatMessage> _messages = new();
-static readonly object _messagesLock = new();
+var _clients = new ConcurrentDictionary<string, ClientConnection>();
+var _messages = new List<ChatMessage>();
+var _messagesLock = new object();
 
 // Middleware для WebSocket
 app.UseWebSockets();
@@ -216,7 +216,8 @@ async Task BroadcastMessage(ServerMessage message)
         }
     }
     
-    await Task.WhenAll(tasks);
+    if (tasks.Count > 0)
+        await Task.WhenAll(tasks);
 }
 
 async Task BroadcastSystemMessage(string text)
